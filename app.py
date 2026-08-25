@@ -11,6 +11,8 @@ from pathlib import Path
 import gradio as gr
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from openpyxl import load_workbook
 from openpyxl.utils.protection import hash_password
 
 PASSWORD = "GLBA"
@@ -110,7 +112,7 @@ def inspect_upload(uploaded_file):
         return gr.Dropdown(choices=[], value=None), gr.Dropdown(choices=[], value=None), f"Could not read the source file: {exc}"
 
 
-def build_dashboard(input_file, selected_month, selected_status, add_branch, new_branch, model_branch):
+def _build_dashboard_core(input_file, selected_month, selected_status, add_branch, new_branch, model_branch):
     if not input_file:
         raise gr.Error("Please upload the source Excel file.")
     if not selected_month:
@@ -952,56 +954,704 @@ def build_dashboard(input_file, selected_month, selected_status, add_branch, new
         raise gr.Error(str(exc))
 
 
-CSS = """
-.gradio-container { max-width: 1100px !important; margin: auto !important; }
-#title { text-align: center; margin-bottom: 0.2rem; }
-#subtitle { text-align: center; color: #64748b; margin-bottom: 1rem; }
-"""
 
-with gr.Blocks(title="MTD Performance Dashboard Generator", css=CSS) as demo:
-    gr.Markdown("# MTD Performance Dashboard Generator", elem_id="title")
-    gr.Markdown(
-        "Upload the MTD Excel source or the previous controlled dashboard. "
-        "The app creates the protected professional `.xlsm` dashboard using the notebook logic.",
-        elem_id="subtitle",
+# -----------------------------------------------------------------------------
+# SECURE WEB APP LAYER
+# -----------------------------------------------------------------------------
+BUILD_VERSION = "LIVE-WEB-2026.08.25-v5"
+
+
+def _credentials():
+    """Read mandatory Admin/User credentials from Render environment variables."""
+    admin_user = os.getenv("ADMIN_USERNAME", "").strip()
+    admin_pass = os.getenv("ADMIN_PASSWORD", "").strip()
+    user_user = os.getenv("USER_USERNAME", "").strip()
+    user_pass = os.getenv("USER_PASSWORD", "").strip()
+    return admin_user, admin_pass, user_user, user_pass
+
+
+def _validate_credentials_config():
+    admin_user, admin_pass, user_user, user_pass = _credentials()
+    missing = []
+    if not admin_user:
+        missing.append("ADMIN_USERNAME")
+    if not admin_pass:
+        missing.append("ADMIN_PASSWORD")
+    if not user_user:
+        missing.append("USER_USERNAME")
+    if not user_pass:
+        missing.append("USER_PASSWORD")
+    if missing:
+        raise RuntimeError(
+            "Mandatory login is enabled. Add these Render Environment Variables: "
+            + ", ".join(missing)
+        )
+
+
+def _auth_user(username, password):
+    admin_user, admin_pass, user_user, user_pass = _credentials()
+    return (
+        (username == admin_user and password == admin_pass)
+        or (username == user_user and password == user_pass)
     )
 
+
+def _role_from_request(request: gr.Request):
+    admin_user, _, user_user, _ = _credentials()
+    username = (getattr(request, "username", None) or "").strip()
+    if username == admin_user:
+        return "ADMIN", username
+    if username == user_user:
+        return "USER", username
+    return "USER", username or "User"
+
+
+def _read_control_settings(input_file):
+    """Read Admin-controlled month/status saved in a previously generated workbook."""
+    if not input_file:
+        return None, None
+    try:
+        wb = load_workbook(input_file, read_only=True, data_only=False, keep_vba=True)
+        if "Data Update" not in wb.sheetnames:
+            wb.close()
+            return None, None
+        ws = wb["Data Update"]
+        month = ws["O2"].value
+        status = ws["O3"].value
+        wb.close()
+        month = str(month).strip() if month is not None else None
+        status = str(status).strip().upper() if status is not None else None
+        if status not in {"OPEN", "CLOSED"}:
+            status = None
+        if month:
+            try:
+                month = pd.to_datetime(month, errors="raise").strftime("%b-%Y")
+            except Exception:
+                # Existing generator stores Mon-YYYY as text, so keep valid text as-is.
+                if not re.fullmatch(r"[A-Za-z]{3}-\d{4}", month):
+                    month = None
+        return month, status
+    except Exception:
+        return None, None
+
+
+def _standardize_web_source(raw, fixed_branch=None):
+    raw = raw.copy()
+    raw.columns = [clean_header_for_ui(c) for c in raw.columns]
+    found = {
+        key: next((c for c in choices if c in raw.columns), None)
+        for key, choices in ALIASES.items()
+    }
+    if not found["date"] or not found["sales_achieved"]:
+        return None
+    if fixed_branch is None and not found["branch"]:
+        return None
+
+    if fixed_branch is None:
+        branch_values = raw[found["branch"]].astype(str).str.strip()
+    else:
+        branch_values = pd.Series([str(fixed_branch).strip()] * len(raw), index=raw.index)
+
+    df = pd.DataFrame({
+        "Branch": branch_values,
+        "Date": pd.to_datetime(raw[found["date"]], errors="coerce"),
+    })
+    mapping = [
+        ("sales_target", "Sales Target"),
+        ("sales_achieved", "Sales Achieved"),
+        ("nob_target", "NOB Target"),
+        ("nob_achieved", "NOB Achieved"),
+        ("abv_target", "ABV Target"),
+        ("abv_actual", "ABV Actual"),
+        ("gp_target", "GP Target"),
+        ("gp_actual", "GP Actual"),
+    ]
+    for key, label in mapping:
+        if found[key]:
+            df[label] = pd.to_numeric(raw[found[key]], errors="coerce")
+        else:
+            df[label] = np.nan
+    # Keep dated rows that contain at least one sales value.
+    df = df[df["Date"].notna() & (df["Sales Achieved"].notna() | df["Sales Target"].notna())].copy()
+    return df
+
+
+def _load_web_data(input_file):
+    if not input_file:
+        return pd.DataFrame()
+    book = pd.ExcelFile(input_file, engine="openpyxl")
+    records = []
+    controlled_sheet = next((s for s in ["Data Update", "Data"] if s in book.sheet_names), None)
+    if controlled_sheet:
+        raw = pd.read_excel(input_file, sheet_name=controlled_sheet, engine="openpyxl")
+        frame = _standardize_web_source(raw)
+        if frame is not None:
+            records.append(frame)
+    else:
+        branch_sheets = [s for s in book.sheet_names if str(s).strip().isdigit()]
+        for sheet in branch_sheets:
+            raw = pd.read_excel(input_file, sheet_name=sheet, engine="openpyxl")
+            frame = _standardize_web_source(raw, fixed_branch=sheet)
+            if frame is not None:
+                frame["Branch"] = frame["Branch"].map(
+                    lambda code: f"{code} - {BRANCH_NAMES.get(str(code), 'NAME NOT MAPPED')}"
+                )
+                records.append(frame)
+    if not records:
+        return pd.DataFrame()
+    data = pd.concat(records, ignore_index=True)
+    data["Branch"] = data["Branch"].astype(str).str.strip()
+    data = data[~data["Branch"].isin(["", "nan", "None"])]
+    data = data.sort_values(["Date", "Branch"]).reset_index(drop=True)
+    return data
+
+
+def _money(v):
+    return f"SAR {float(v):,.0f}"
+
+
+def _pct(v):
+    return f"{float(v):.1%}"
+
+
+def _empty_figure(title, message="Upload an Excel file to populate this chart."):
+    fig = go.Figure()
+    fig.add_annotation(text=message, x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+                       font=dict(size=14, color="#64748B"))
+    fig.update_layout(title=title, template="plotly_white", height=330,
+                      margin=dict(l=35, r=20, t=55, b=35),
+                      paper_bgcolor="white", plot_bgcolor="white")
+    return fig
+
+
+def _card(label, value, tone="navy", foot=""):
+    return (
+        f'<div class="kpi-card {tone}">'
+        f'<div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value">{value}</div>'
+        f'<div class="kpi-foot">{foot or "&nbsp;"}</div>'
+        f'</div>'
+    )
+
+
+def _kpi_html(values):
+    cards = [
+        _card("SALES TARGET", _money(values["sales_target"]), "blue"),
+        _card("SALES ACHIEVED", _money(values["sales_actual"]), "green"),
+        _card("SALES ACHIEVEMENT", _pct(values["sales_pct"]), "orange"),
+        _card("SALES VARIANCE", _money(values["variance"]), "green" if values["variance"] >= 0 else "red"),
+        _card("NOB TARGET", f'{values["nob_target"]:,.0f}', "purple"),
+        _card("NOB ACHIEVED", f'{values["nob_actual"]:,.0f}', "purple"),
+        _card("NOB ACHIEVEMENT", _pct(values["nob_pct"]), "orange"),
+        _card("ABV TARGET", _money(values["abv_target"]), "blue"),
+        _card("ABV ACTUAL", _money(values["abv_actual"]), "green"),
+        _card("PREVIOUS PERIOD SALES", _money(values["previous_sales"]), "navy"),
+        _card("PERIOD CHANGE", _pct(values["period_change"]), "green" if values["period_change"] >= 0 else "red"),
+        _card("TOP BRANCH", values["top_branch"] or "Not available", "navy"),
+    ]
+    return '<div class="kpi-grid">' + "".join(cards) + "</div>"
+
+
+def _insights_html(frame):
+    if frame.empty:
+        return '<div class="empty-panel">No data for the selected filters.</div>'
+    grouped = frame.groupby("Branch", as_index=False).agg(
+        Target=("Sales Target", "sum"),
+        Actual=("Sales Achieved", "sum"),
+        NOB_Target=("NOB Target", "sum"),
+        NOB_Actual=("NOB Achieved", "sum"),
+    )
+    grouped["Pct"] = np.where(grouped["Target"] != 0, grouped["Actual"] / grouped["Target"], 0)
+    grouped["NOB_Pct"] = np.where(grouped["NOB_Target"] != 0, grouped["NOB_Actual"] / grouped["NOB_Target"], 0)
+    rows = []
+    for _, r in grouped.sort_values("Pct").head(6).iterrows():
+        pct = float(r["Pct"])
+        gap = float(r["Actual"] - r["Target"])
+        if pct >= 1:
+            tag, cls, action = "▲ POSITIVE", "positive", "Maintain the current pace."
+        elif pct >= 0.85:
+            tag, cls, action = "● WATCH", "watch", "Close the remaining sales gap and review ABV."
+        else:
+            tag, cls, action = "⚠ CRITICAL", "critical", "Start a daily recovery plan and review conversion."
+        rows.append(
+            f'<div class="insight-row"><span class="insight-tag {cls}">{tag}</span>'
+            f'<span><b>{r["Branch"]}</b> — Sales {_pct(pct)}; gap {_money(abs(gap))}; '
+            f'bills {_pct(float(r["NOB_Pct"]))}. {action}</span></div>'
+        )
+    return '<div class="insights">' + "".join(rows) + "</div>"
+
+
+def _forecast_html(values):
+    items = [
+        ("Elapsed Days", f'{values["elapsed_days"]} / {values["days_in_month"]}'),
+        ("Days Remaining", f'{values["days_remaining"]}'),
+        ("Month-End Forecast", _money(values["month_end_forecast"])),
+        ("Projected Target", _money(values["projected_target"])),
+        ("Forecast Gap", _money(values["forecast_gap"])),
+        ("Remaining Target", _money(values["remaining_target"])),
+        ("Required Daily Sales", _money(values["required_daily_sales"])),
+    ]
+    html = ''.join(f'<div class="forecast-card"><span>{a}</span><b>{b}</b></div>' for a, b in items)
+    return '<div class="forecast-grid">' + html + '</div>'
+
+
+def _heatmap_html(frame):
+    if frame.empty:
+        return '<div class="empty-panel">No branch performance data.</div>'
+    g = frame.groupby("Branch", as_index=False).agg(
+        Target=("Sales Target", "sum"), Actual=("Sales Achieved", "sum"),
+        NOB_Target=("NOB Target", "sum"), NOB_Actual=("NOB Achieved", "sum"),
+    )
+    g["SalesPct"] = np.where(g["Target"] != 0, g["Actual"] / g["Target"], 0)
+    g["Gap"] = g["Actual"] - g["Target"]
+    g["NOBPct"] = np.where(g["NOB_Target"] != 0, g["NOB_Actual"] / g["NOB_Target"], 0)
+    trs = []
+    for _, r in g.sort_values("SalesPct", ascending=False).iterrows():
+        pct = float(r["SalesPct"])
+        status = "ON TRACK" if pct >= 1 else ("WATCH" if pct >= 0.85 else "CRITICAL")
+        cls = "positive" if pct >= 1 else ("watch" if pct >= 0.85 else "critical")
+        gap_cls = "positive" if float(r["Gap"]) >= 0 else "critical"
+        trs.append(
+            f'<tr><td class="branch-cell">{r["Branch"]}</td>'
+            f'<td class="heat {cls}">{_pct(pct)}</td>'
+            f'<td class="heat {gap_cls}">{_money(float(r["Gap"]))}</td>'
+            f'<td>{_pct(float(r["NOBPct"]))}</td>'
+            f'<td class="status {cls}">{status}</td></tr>'
+        )
+    return (
+        '<div class="table-wrap"><table class="heatmap-table"><thead><tr>'
+        '<th>BRANCH</th><th>SALES %</th><th>GAP • SAR</th><th>NOB %</th><th>STATUS</th>'
+        '</tr></thead><tbody>' + ''.join(trs) + '</tbody></table></div>'
+    )
+
+
+def _filtered_frame(data, branch, month, date_filter):
+    frame = data.copy()
+    if branch and branch != "All Branches":
+        frame = frame[frame["Branch"] == branch]
+    if month and month != "All Months":
+        frame = frame[frame["Date"].dt.strftime("%b-%Y") == month]
+    if date_filter and date_filter != "All Dates":
+        try:
+            dt = pd.to_datetime(date_filter, format="%d-%b-%Y")
+        except Exception:
+            dt = pd.to_datetime(date_filter, errors="coerce")
+        if pd.notna(dt):
+            frame = frame[frame["Date"].dt.normalize() == pd.Timestamp(dt).normalize()]
+    return frame
+
+
+def _dashboard_values(data, frame, selected_month):
+    def total(col):
+        v = frame[col].sum(min_count=1)
+        return 0.0 if pd.isna(v) else float(v)
+
+    sales_target = total("Sales Target")
+    sales_actual = total("Sales Achieved")
+    nob_target = total("NOB Target")
+    nob_actual = total("NOB Achieved")
+    sales_pct = sales_actual / sales_target if sales_target else 0.0
+    nob_pct = nob_actual / nob_target if nob_target else 0.0
+    variance = sales_actual - sales_target
+    abv_actual = sales_actual / nob_actual if nob_actual else 0.0
+    abv_target = float(frame["ABV Target"].dropna().mean()) if frame["ABV Target"].notna().any() else 0.0
+
+    month_period = None
+    if selected_month and selected_month != "All Months":
+        try:
+            month_period = pd.Period(pd.to_datetime(selected_month, format="%b-%Y"), freq="M")
+        except Exception:
+            month_period = None
+    if month_period is None and not frame.empty:
+        month_period = frame["Date"].max().to_period("M")
+
+    previous_sales = 0.0
+    period_change = 0.0
+    elapsed_days = int(frame["Date"].max().day) if not frame.empty else 0
+    days_in_month = int(month_period.days_in_month) if month_period is not None else 0
+
+    if month_period is not None:
+        prev_period = month_period - 1
+        prev = data[data["Date"].dt.to_period("M") == prev_period].copy()
+        if not frame.empty and frame["Branch"].nunique() == 1:
+            prev = prev[prev["Branch"] == frame["Branch"].iloc[0]]
+        if elapsed_days:
+            cutoff = min(elapsed_days, prev_period.days_in_month)
+            prev = prev[prev["Date"].dt.day <= cutoff]
+        p = prev["Sales Achieved"].sum(min_count=1)
+        previous_sales = 0.0 if pd.isna(p) else float(p)
+        period_change = (sales_actual - previous_sales) / previous_sales if previous_sales else 0.0
+
+    days_remaining = max(days_in_month - elapsed_days, 0)
+    month_end_forecast = sales_actual / elapsed_days * days_in_month if elapsed_days else 0.0
+    projected_target = sales_target / elapsed_days * days_in_month if elapsed_days else 0.0
+    forecast_gap = month_end_forecast - projected_target
+    remaining_target = max(projected_target - sales_actual, 0.0)
+    required_daily_sales = remaining_target / days_remaining if days_remaining else 0.0
+
+    top_branch = ""
+    if not frame.empty:
+        b = frame.groupby("Branch", as_index=False).agg(Target=("Sales Target", "sum"), Actual=("Sales Achieved", "sum"))
+        b["Pct"] = np.where(b["Target"] != 0, b["Actual"] / b["Target"], 0)
+        if not b.empty:
+            row = b.sort_values("Pct", ascending=False).iloc[0]
+            top_branch = f'{row["Branch"]} • {_pct(float(row["Pct"]))}'
+
+    return dict(
+        sales_target=sales_target, sales_actual=sales_actual, sales_pct=sales_pct, variance=variance,
+        nob_target=nob_target, nob_actual=nob_actual, nob_pct=nob_pct,
+        abv_target=abv_target, abv_actual=abv_actual,
+        previous_sales=previous_sales, period_change=period_change, top_branch=top_branch,
+        elapsed_days=elapsed_days, days_in_month=days_in_month, days_remaining=days_remaining,
+        month_end_forecast=month_end_forecast, projected_target=projected_target,
+        forecast_gap=forecast_gap, remaining_target=remaining_target,
+        required_daily_sales=required_daily_sales,
+    )
+
+
+def render_live_dashboard(input_file, branch, month, date_filter):
+    if not input_file:
+        empty = _empty_figure("Daily Sales Trend")
+        return (
+            '<div class="empty-panel hero-empty">Upload an MTD Excel file to load the live dashboard.</div>',
+            '<div class="empty-panel">Management insights will appear here.</div>',
+            '<div class="empty-panel">Forecast & pace will appear here.</div>',
+            empty,
+            _empty_figure("Branch Target vs Achieved"),
+            _empty_figure("Current vs Previous Period"),
+            '<div class="empty-panel">Branch performance heatmap will appear here.</div>',
+            _empty_figure("Bill / NOB Achievement"),
+            pd.DataFrame(columns=["Branch", "Date", "Sales Target", "Sales Achieved", "Gap", "Sales %", "Flag"]),
+            "Waiting for source file.",
+        )
+    try:
+        data = _load_web_data(input_file)
+        if data.empty:
+            raise ValueError("No usable daily branch data found in the workbook.")
+        frame = _filtered_frame(data, branch, month, date_filter)
+        values = _dashboard_values(data, frame, month)
+
+        # Daily Sales Trend
+        daily = frame.groupby("Date", as_index=False).agg(Target=("Sales Target", "sum"), Actual=("Sales Achieved", "sum"))
+        daily_fig = go.Figure()
+        daily_fig.add_trace(go.Scatter(x=daily["Date"], y=daily["Target"], mode="lines+markers", name="Target"))
+        daily_fig.add_trace(go.Scatter(x=daily["Date"], y=daily["Actual"], mode="lines+markers", name="Achieved"))
+        daily_fig.update_layout(template="plotly_white", height=340, margin=dict(l=35,r=20,t=45,b=35),
+                                legend=dict(orientation="h", y=1.12), yaxis_title="SAR", xaxis_title="")
+
+        # Branch Target vs Achieved
+        bg = frame.groupby("Branch", as_index=False).agg(Target=("Sales Target", "sum"), Actual=("Sales Achieved", "sum"))
+        branch_fig = go.Figure()
+        branch_fig.add_trace(go.Bar(x=bg["Branch"], y=bg["Target"], name="Target"))
+        branch_fig.add_trace(go.Bar(x=bg["Branch"], y=bg["Actual"], name="Achieved"))
+        branch_fig.update_layout(barmode="group", template="plotly_white", height=350,
+                                 margin=dict(l=35,r=20,t=45,b=90), legend=dict(orientation="h", y=1.12),
+                                 yaxis_title="SAR", xaxis_tickangle=-25)
+
+        # Current vs previous period by branch.
+        current_period = None
+        if month and month != "All Months":
+            try:
+                current_period = pd.Period(pd.to_datetime(month, format="%b-%Y"), freq="M")
+            except Exception:
+                pass
+        if current_period is None:
+            current_period = data["Date"].max().to_period("M")
+        prev_period = current_period - 1
+        current_cmp = data[data["Date"].dt.to_period("M") == current_period].copy()
+        prev_cmp = data[data["Date"].dt.to_period("M") == prev_period].copy()
+        if branch and branch != "All Branches":
+            current_cmp = current_cmp[current_cmp["Branch"] == branch]
+            prev_cmp = prev_cmp[prev_cmp["Branch"] == branch]
+        elapsed = int(current_cmp["Date"].max().day) if not current_cmp.empty else current_period.days_in_month
+        prev_cmp = prev_cmp[prev_cmp["Date"].dt.day <= min(elapsed, prev_period.days_in_month)]
+        c = current_cmp.groupby("Branch", as_index=False)["Sales Achieved"].sum().rename(columns={"Sales Achieved":"Current"})
+        p = prev_cmp.groupby("Branch", as_index=False)["Sales Achieved"].sum().rename(columns={"Sales Achieved":"Previous"})
+        comp = pd.merge(c, p, on="Branch", how="outer").fillna(0)
+        comp_fig = go.Figure()
+        comp_fig.add_trace(go.Bar(x=comp["Branch"], y=comp["Previous"], name=f"{prev_period.to_timestamp():%b-%Y}"))
+        comp_fig.add_trace(go.Bar(x=comp["Branch"], y=comp["Current"], name=f"{current_period.to_timestamp():%b-%Y}"))
+        comp_fig.update_layout(barmode="group", template="plotly_white", height=350,
+                               margin=dict(l=35,r=20,t=45,b=90), legend=dict(orientation="h", y=1.12),
+                               yaxis_title="SAR", xaxis_tickangle=-25)
+
+        # NOB achievement by branch.
+        ng = frame.groupby("Branch", as_index=False).agg(Target=("NOB Target", "sum"), Actual=("NOB Achieved", "sum"))
+        ng["Pct"] = np.where(ng["Target"] != 0, ng["Actual"] / ng["Target"], 0)
+        nob_fig = go.Figure(go.Bar(x=ng["Pct"], y=ng["Branch"], orientation="h", text=[_pct(x) for x in ng["Pct"]], textposition="outside"))
+        nob_fig.update_layout(template="plotly_white", height=max(330, 55 * max(len(ng), 1)),
+                              margin=dict(l=35,r=45,t=45,b=35), xaxis_tickformat=".0%", xaxis_title="Achievement",
+                              yaxis_title="")
+
+        # Daily exception report.
+        ex = frame.groupby(["Branch", "Date"], as_index=False).agg(
+            **{"Sales Target": ("Sales Target", "sum"), "Sales Achieved": ("Sales Achieved", "sum")}
+        )
+        ex["Gap"] = ex["Sales Achieved"] - ex["Sales Target"]
+        ex["Sales %"] = np.where(ex["Sales Target"] != 0, ex["Sales Achieved"] / ex["Sales Target"], 0)
+        ex["Flag"] = np.where(ex["Sales %"] >= 1, "ON TRACK", np.where(ex["Sales %"] >= .85, "WATCH", "CRITICAL"))
+        ex = ex[ex["Flag"] != "ON TRACK"].sort_values(["Sales %", "Date"]).head(40)
+        ex["Date"] = ex["Date"].dt.strftime("%d-%b-%Y")
+        ex["Sales %"] = ex["Sales %"].map(lambda x: f"{x:.1%}")
+        for col in ["Sales Target", "Sales Achieved", "Gap"]:
+            ex[col] = ex[col].map(lambda x: round(float(x), 2))
+
+        status = f"Live dashboard loaded: {len(data):,} source rows | showing {len(frame):,} filtered rows."
+        return (
+            _kpi_html(values), _insights_html(frame), _forecast_html(values), daily_fig, branch_fig,
+            comp_fig, _heatmap_html(frame), nob_fig, ex, status
+        )
+    except Exception as exc:
+        msg = f"Could not build live dashboard: {exc}"
+        return (
+            f'<div class="empty-panel critical">{msg}</div>', '<div class="empty-panel">No insights.</div>',
+            '<div class="empty-panel">No forecast.</div>', _empty_figure("Daily Sales Trend", msg),
+            _empty_figure("Branch Target vs Achieved", msg), _empty_figure("Current vs Previous Period", msg),
+            '<div class="empty-panel">No heatmap.</div>', _empty_figure("Bill / NOB Achievement", msg),
+            pd.DataFrame(), msg
+        )
+
+
+def initialize_live_dashboard(input_file):
+    if not input_file:
+        return (
+            gr.Dropdown(choices=["All Branches"], value="All Branches"),
+            gr.Dropdown(choices=["All Months"], value="All Months"),
+            gr.Dropdown(choices=["All Dates"], value="All Dates"),
+            *render_live_dashboard(None, "All Branches", "All Months", "All Dates")
+        )
+    try:
+        data = _load_web_data(input_file)
+        if data.empty:
+            raise ValueError("No usable data found.")
+        branches = ["All Branches"] + sorted(data["Branch"].dropna().unique().tolist())
+        periods = sorted(data["Date"].dt.to_period("M").dropna().unique().tolist())
+        months = [p.to_timestamp().strftime("%b-%Y") for p in periods]
+        default_month = months[-1] if months else "All Months"
+        month_choices = ["All Months"] + months
+        dates = sorted(data[data["Date"].dt.strftime("%b-%Y") == default_month]["Date"].dropna().unique().tolist())
+        date_choices = ["All Dates"] + [pd.Timestamp(d).strftime("%d-%b-%Y") for d in dates]
+        dashboard_outputs = render_live_dashboard(input_file, "All Branches", default_month, "All Dates")
+        return (
+            gr.Dropdown(choices=branches, value="All Branches"),
+            gr.Dropdown(choices=month_choices, value=default_month),
+            gr.Dropdown(choices=date_choices, value="All Dates"),
+            *dashboard_outputs
+        )
+    except Exception as exc:
+        return (
+            gr.Dropdown(choices=["All Branches"], value="All Branches"),
+            gr.Dropdown(choices=["All Months"], value="All Months"),
+            gr.Dropdown(choices=["All Dates"], value="All Dates"),
+            *render_live_dashboard(None, "All Branches", "All Months", "All Dates")[:-1],
+            f"Could not initialize dashboard: {exc}",
+        )
+
+
+def update_date_choices(input_file, month):
+    if not input_file:
+        return gr.Dropdown(choices=["All Dates"], value="All Dates")
+    try:
+        data = _load_web_data(input_file)
+        if month and month != "All Months":
+            data = data[data["Date"].dt.strftime("%b-%Y") == month]
+        dates = sorted(data["Date"].dropna().unique().tolist())
+        choices = ["All Dates"] + [pd.Timestamp(d).strftime("%d-%b-%Y") for d in dates]
+        return gr.Dropdown(choices=choices, value="All Dates")
+    except Exception:
+        return gr.Dropdown(choices=["All Dates"], value="All Dates")
+
+
+def inspect_upload_secure(uploaded_file, request: gr.Request):
+    role, _ = _role_from_request(request)
+    if not uploaded_file:
+        return gr.Dropdown(choices=[], value=None), gr.Dropdown(choices=[], value=None), "Upload an Excel source file first."
+    try:
+        months, branches = _extract_source_info(uploaded_file)
+        persisted_month, persisted_status = _read_control_settings(uploaded_file)
+        default_month = persisted_month or (months[-2] if len(months) >= 2 else (months[-1] if months else None))
+        default_model = branches[0] if branches else None
+        if role == "ADMIN":
+            message = f"Admin source loaded: {len(branches)} branch(es). You may set the controlled period and branch control."
+        else:
+            if persisted_month and persisted_status:
+                message = f"Controlled workbook loaded: {persisted_month} | {persisted_status}. Admin controls are locked for your account."
+            else:
+                message = "Dashboard preview is available, but this workbook is not Admin-controlled yet. Ask Admin to initialize the period before generating a new XLSM."
+        return gr.Dropdown(choices=months, value=default_month), gr.Dropdown(choices=branches, value=default_model), message
+    except Exception as exc:
+        return gr.Dropdown(choices=[], value=None), gr.Dropdown(choices=[], value=None), f"Could not read the source file: {exc}"
+
+
+def build_dashboard_secure(input_file, selected_month, selected_status, add_branch, new_branch, model_branch, request: gr.Request):
+    """Enforce Admin-only period/new-branch changes on the server, not just in the UI."""
+    role, username = _role_from_request(request)
+    if role == "ADMIN":
+        return _build_dashboard_core(input_file, selected_month, selected_status, add_branch, new_branch, model_branch)
+
+    persisted_month, persisted_status = _read_control_settings(input_file)
+    if not persisted_month or not persisted_status:
+        raise gr.Error(
+            "Admin setup required. Normal users cannot OPEN/CLOSE a period or initialize a new company/branch. "
+            "Please ask Admin to generate the controlled workbook once."
+        )
+    # Ignore any browser-manipulated Admin values and force persisted workbook control.
+    return _build_dashboard_core(input_file, persisted_month, persisted_status, "NO", "", "")
+
+
+def page_role(request: gr.Request):
+    role, username = _role_from_request(request)
+    if role == "ADMIN":
+        badge = f'<div class="role-badge admin">ADMIN • {username} &nbsp;|&nbsp; Period & Branch controls enabled</div>'
+        return badge, gr.update(visible=True)
+    badge = f'<div class="role-badge user">USER • {username} &nbsp;|&nbsp; View / filter / download only</div>'
+    return badge, gr.update(visible=False)
+
+
+CSS = r"""
+:root { --navy:#153B5B; --blue:#2673C9; --teal:#12A7A0; --green:#24A148; --orange:#F59E0B; --red:#D64545; --bg:#F3F7FB; --muted:#64748B; }
+.gradio-container { max-width: 1480px !important; margin:auto !important; background:#F3F7FB !important; }
+#app-title h1 { color:#153B5B; margin-bottom:0 !important; font-weight:800; }
+#app-subtitle { color:#64748B; margin-top:0 !important; }
+.role-badge { padding:10px 16px; border-radius:10px; font-weight:700; margin-bottom:10px; display:inline-block; }
+.role-badge.admin { background:#EAF8F3; color:#13795B; border:1px solid #8CD2B5; }
+.role-badge.user { background:#EAF3FF; color:#155AA8; border:1px solid #A9CBF3; }
+.admin-box { border:1px solid #F4C36A !important; background:#FFFDF7 !important; border-radius:12px !important; padding:10px !important; }
+.section-title { background:#2673C9; color:white; font-weight:800; padding:10px 14px; border-radius:9px 9px 0 0; margin-top:10px; letter-spacing:.2px; }
+.kpi-grid { display:grid; grid-template-columns:repeat(6,minmax(150px,1fr)); gap:10px; margin:10px 0 16px; }
+.kpi-card { background:white; border:1px solid #D7E2EC; border-radius:12px; padding:13px 12px; box-shadow:0 2px 8px rgba(21,59,91,.06); min-height:108px; }
+.kpi-card.blue { border-top:4px solid #2673C9; } .kpi-card.green { border-top:4px solid #24A148; }
+.kpi-card.orange { border-top:4px solid #F59E0B; } .kpi-card.red { border-top:4px solid #D64545; }
+.kpi-card.purple { border-top:4px solid #6D4CC2; } .kpi-card.navy { border-top:4px solid #153B5B; }
+.kpi-label { color:#64748B; font-size:12px; font-weight:800; } .kpi-value { color:#153B5B; font-size:22px; font-weight:850; margin-top:9px; }
+.kpi-foot { color:#94A3B8; font-size:10px; margin-top:5px; }
+.insights { background:white; border:1px solid #D7E2EC; border-radius:0 0 10px 10px; padding:8px 12px; }
+.insight-row { display:flex; gap:10px; align-items:center; border-bottom:1px solid #EEF2F7; padding:9px 0; color:#203040; }
+.insight-row:last-child { border-bottom:none; } .insight-tag { min-width:94px; padding:5px 8px; border-radius:7px; text-align:center; font-size:11px; font-weight:800; }
+.positive { background:#DDF4E9 !important; color:#116149 !important; } .watch { background:#FFF1CC !important; color:#8A5300 !important; } .critical { background:#FDE2E2 !important; color:#B42318 !important; }
+.forecast-grid { display:grid; grid-template-columns:repeat(7,minmax(120px,1fr)); gap:8px; background:white; border:1px solid #D7E2EC; padding:10px; border-radius:0 0 10px 10px; }
+.forecast-card { padding:9px; background:#F8FAFC; border-radius:8px; border:1px solid #E2E8F0; display:flex; flex-direction:column; gap:4px; }
+.forecast-card span { color:#64748B; font-size:11px; font-weight:700; } .forecast-card b { color:#153B5B; font-size:16px; }
+.empty-panel { background:white; border:1px dashed #CBD5E1; border-radius:10px; padding:22px; color:#64748B; text-align:center; }
+.hero-empty { padding:48px 20px; font-size:16px; }
+.table-wrap { overflow:auto; background:white; border:1px solid #D7E2EC; border-radius:0 0 10px 10px; }
+.heatmap-table { width:100%; border-collapse:collapse; font-size:13px; } .heatmap-table th { background:#153B5B; color:white; padding:10px; text-align:center; }
+.heatmap-table td { border-bottom:1px solid #E5EDF4; padding:10px; text-align:center; } .heatmap-table .branch-cell { text-align:left; font-weight:700; color:#153B5B; }
+.heatmap-table .heat, .heatmap-table .status { font-weight:800; border-radius:0; }
+#generate-btn { background:#F57C20 !important; color:white !important; font-weight:800 !important; min-height:44px; }
+footer { display:none !important; }
+@media (max-width:1100px){ .kpi-grid{grid-template-columns:repeat(3,1fr)} .forecast-grid{grid-template-columns:repeat(3,1fr)} }
+@media (max-width:700px){ .kpi-grid{grid-template-columns:repeat(2,1fr)} .forecast-grid{grid-template-columns:repeat(2,1fr)} }
+"""
+
+with gr.Blocks(title="MTD Performance Dashboard") as demo:
+    gr.Markdown("# MTD Performance Dashboard", elem_id="app-title")
+    gr.Markdown(
+        f"**Build: {BUILD_VERSION}** &nbsp; • &nbsp; Live browser dashboard + protected XLSM download",
+        elem_id="app-subtitle",
+    )
+    role_badge = gr.HTML()
+
+    with gr.Row(equal_height=True):
+        source_file = gr.File(label="Upload MTD Excel", file_types=[".xlsx", ".xlsm"], type="filepath", scale=2)
+        with gr.Column(scale=2):
+            source_status = gr.Textbox(label="Source / Control Status", lines=3, interactive=False)
+            with gr.Row():
+                web_branch = gr.Dropdown(label="Dashboard Branch", choices=["All Branches"], value="All Branches")
+                web_month = gr.Dropdown(label="Dashboard Month", choices=["All Months"], value="All Months")
+                web_date = gr.Dropdown(label="Dashboard Date", choices=["All Dates"], value="All Dates")
+
+    with gr.Column(visible=False, elem_classes="admin-box") as admin_panel:
+        gr.Markdown("### 🔐 Admin Controls — Period / New Company-Branch Setup")
+        with gr.Row():
+            controlled_month = gr.Dropdown(label="Controlled Month", choices=[])
+            period_status = gr.Radio(["OPEN", "CLOSED"], value="OPEN", label="Period Status")
+            add_branch = gr.Radio(["NO", "YES"], value="NO", label="Add a new approved branch?")
+        with gr.Row():
+            new_branch = gr.Textbox(label="New Branch", placeholder="Example: 115 - NEW BRANCH")
+            model_branch = gr.Dropdown(label="Copy Targets From Existing Branch", choices=[])
+
+    gr.HTML('<div class="section-title">EXECUTIVE KPI VIEW</div>')
+    kpi_panel = gr.HTML('<div class="empty-panel hero-empty">Upload an MTD Excel file to load the live dashboard.</div>')
+
+    gr.HTML('<div class="section-title">MANAGEMENT INSIGHTS</div>')
+    insights_panel = gr.HTML('<div class="empty-panel">Management insights will appear here.</div>')
+
+    gr.HTML('<div class="section-title">FORECAST & PACE</div>')
+    forecast_panel = gr.HTML('<div class="empty-panel">Forecast & pace will appear here.</div>')
+
     with gr.Row():
-        source_file = gr.File(label="1. Upload Source Excel", file_types=[".xlsx", ".xlsm"], type="filepath")
         with gr.Column():
-            controlled_month = gr.Dropdown(label="2. Controlled Month", choices=[])
-            period_status = gr.Radio(["OPEN", "CLOSED"], value="OPEN", label="3. Period Status")
+            gr.HTML('<div class="section-title">DAILY SALES TREND</div>')
+            daily_plot = gr.Plot(value=_empty_figure("Daily Sales Trend"), show_label=False)
+        with gr.Column():
+            gr.HTML('<div class="section-title">BRANCH TARGET VS ACHIEVED</div>')
+            branch_plot = gr.Plot(value=_empty_figure("Branch Target vs Achieved"), show_label=False)
 
-    gr.Markdown("### Optional Branch Control")
-    add_branch = gr.Radio(["NO", "YES"], value="NO", label="Add a new approved branch?")
     with gr.Row():
-        new_branch = gr.Textbox(label="New Branch", placeholder="Example: 115 - NEW BRANCH")
-        model_branch = gr.Dropdown(label="Copy Targets From Existing Branch", choices=[])
+        with gr.Column():
+            gr.HTML('<div class="section-title">CURRENT VS PREVIOUS PERIOD</div>')
+            comparison_plot = gr.Plot(value=_empty_figure("Current vs Previous Period"), show_label=False)
+        with gr.Column():
+            gr.HTML('<div class="section-title">BILL / NOB ACHIEVEMENT</div>')
+            nob_plot = gr.Plot(value=_empty_figure("Bill / NOB Achievement"), show_label=False)
 
-    source_status = gr.Textbox(label="Source Check", interactive=False)
-    generate_btn = gr.Button("Generate Dashboard", variant="primary")
-    output_file = gr.File(label="Download Generated Dashboard")
-    generation_status = gr.Textbox(label="Generation Status", lines=7, interactive=False)
+    gr.HTML('<div class="section-title">BRANCH PERFORMANCE HEATMAP</div>')
+    heatmap_panel = gr.HTML('<div class="empty-panel">Branch performance heatmap will appear here.</div>')
 
-    source_file.change(fn=inspect_upload, inputs=[source_file], outputs=[controlled_month, model_branch, source_status])
+    gr.HTML('<div class="section-title">DAILY EXCEPTION REPORT</div>')
+    exceptions_table = gr.Dataframe(
+        headers=["Branch", "Date", "Sales Target", "Sales Achieved", "Gap", "Sales %", "Flag"],
+        interactive=False, wrap=True, max_height=420,
+    )
+    dashboard_status = gr.Textbox(label="Live Dashboard Status", interactive=False)
+
+    with gr.Row():
+        generate_btn = gr.Button("Generate / Refresh XLSM Download", variant="primary", elem_id="generate-btn", scale=2)
+        output_file = gr.File(label="Download Generated Dashboard", scale=2)
+    generation_status = gr.Textbox(label="Generation Status", lines=5, interactive=False)
+
+    dashboard_outputs = [
+        kpi_panel, insights_panel, forecast_panel, daily_plot, branch_plot,
+        comparison_plot, heatmap_panel, nob_plot, exceptions_table, dashboard_status
+    ]
+
+    demo.load(fn=page_role, inputs=None, outputs=[role_badge, admin_panel])
+
+    source_file.change(
+        fn=inspect_upload_secure,
+        inputs=[source_file],
+        outputs=[controlled_month, model_branch, source_status],
+    )
+    source_file.change(
+        fn=initialize_live_dashboard,
+        inputs=[source_file],
+        outputs=[web_branch, web_month, web_date] + dashboard_outputs,
+    )
+
+    web_month.change(fn=update_date_choices, inputs=[source_file, web_month], outputs=[web_date])
+    for control in [web_branch, web_month, web_date]:
+        control.change(
+            fn=render_live_dashboard,
+            inputs=[source_file, web_branch, web_month, web_date],
+            outputs=dashboard_outputs,
+        )
+
     generate_btn.click(
-        fn=build_dashboard,
+        fn=build_dashboard_secure,
         inputs=[source_file, controlled_month, period_status, add_branch, new_branch, model_branch],
         outputs=[output_file, generation_status],
     )
 
 
-def _auth_from_env():
-    username = os.getenv("APP_USERNAME", "").strip()
-    password = os.getenv("APP_PASSWORD", "").strip()
-    return (username, password) if username and password else None
-
-
 if __name__ == "__main__":
+    _validate_credentials_config()
     port = int(os.getenv("PORT", "7860"))
     demo.queue().launch(
         server_name="0.0.0.0",
         server_port=port,
-        auth=_auth_from_env(),
+        auth=_auth_user,
+        auth_message="Sign in with your Admin or User account.",
+        css=CSS,
         show_error=True,
     )
